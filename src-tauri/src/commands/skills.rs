@@ -13,7 +13,7 @@ use crate::core::{
     error::AppError,
     git_fetcher,
     install_cancel::InstallCancelRegistry,
-    installer, log_sanitize, path_guard,
+    installer, path_guard,
     repo_lock::RepoLock,
     scanner, scenario_service,
     skill_metadata::{self, is_valid_skill_dir},
@@ -1632,9 +1632,9 @@ pub struct PrefetchedRemote {
     /// The `(source_revision, subpath)` pairs whose directory is the same tree
     /// at the resolved revision — see [`git_fetcher::unchanged_subtrees`].
     unchanged: HashSet<(String, String)>,
-    /// Why those directories could not be compared, when the comparison failed
-    /// with the remote unreachable — see [`comparison_failure`].
-    unreachable: Option<String>,
+    /// Why those directories could not be compared. A resolved head alone
+    /// does not establish whether an installed subtree changed.
+    comparison_error: Option<String>,
 }
 
 /// The directory a subpath skill was installed from, as `(revision, subpath)`.
@@ -1656,16 +1656,11 @@ fn resolve_remote(
             .map_err(|err| err.to_string())
     };
     let result = resolve();
-    let (unchanged, unreachable) = match &result {
+    let (unchanged, comparison_error) = match &result {
         Ok(head) => {
             match git_fetcher::unchanged_subtrees(&key.clone_url, head, installed, proxy_url) {
                 Ok(unchanged) => (unchanged, None),
-                Err(err) => {
-                    let unreachable = comparison_failure(&key.clone_url, &err.to_string(), || {
-                        resolve().map(drop)
-                    });
-                    (HashSet::new(), unreachable)
-                }
+                Err(err) => (HashSet::new(), Some(err.to_string())),
             }
         }
         Err(_) => (HashSet::new(), None),
@@ -1674,42 +1669,8 @@ fn resolve_remote(
         key,
         result,
         unchanged,
-        unreachable,
+        comparison_error,
     }
-}
-
-/// What a failed subtree comparison still lets the check claim (#582).
-///
-/// The comparison is a second trip to the remote, made after its head
-/// resolved, and it can fail on its own: the network drops, a TLS handshake
-/// breaks, the remote stops answering. Then nothing is known about the
-/// directories, so the remote is resolved again to tell why. If it no longer
-/// resolves, it is unreachable right now: the comparison's error is returned,
-/// and the subpath skills that needed it are recorded as a failed check, as
-/// when the head itself cannot be resolved, and asked again next round. If it
-/// still resolves, the failure lies with the request — an installed revision
-/// the server no longer has, a server that cannot serve a shallow or partial
-/// fetch, a local error — which no retry answers, so those skills keep
-/// reporting an update, as before.
-fn comparison_failure(
-    url: &str,
-    error: &str,
-    resolve_again: impl FnOnce() -> Result<(), String>,
-) -> Option<String> {
-    let unreachable = resolve_again().err().map(|_| error.to_string());
-    let outcome = if unreachable.is_some() {
-        "the remote no longer resolves, reporting a failed check"
-    } else {
-        "reporting updates as before"
-    };
-    // A URL may carry `user:token@`, and git's stderr in `error` may repeat it.
-    log::info!(
-        "{}",
-        log_sanitize::sanitize(&format!(
-            "subtree comparison for {url} unavailable, {outcome}: {error}"
-        ))
-    );
-    unreachable
 }
 
 /// Resolve one skill's remote revision *before* the caller takes the
@@ -2848,7 +2809,7 @@ pub fn check_skill_update_internal_with_remote(
             let Some(PrefetchedRemote {
                 result: remote_result,
                 unchanged,
-                unreachable,
+                comparison_error,
                 ..
             }) = prefetched.filter(|prefetched| prefetched.key.matches(&git_source))
             else {
@@ -2861,11 +2822,11 @@ pub fn check_skill_update_internal_with_remote(
             match remote_result {
                 Ok(remote_revision) => {
                     // The repo moved, and the comparison that answers for this
-                    // skill's directory could not reach the remote (#582). That
+                    // skill's directory failed (#582). That
                     // says nothing about the skill, so it is not an update:
                     // record a failed check, as for a head that could not be
                     // resolved, and let the next round ask again.
-                    if let Some(message) = unreachable.filter(|_| {
+                    if let Some(message) = comparison_error.filter(|_| {
                         skill.source_revision.as_deref() != Some(remote_revision.as_str())
                             && installed_subtree(&skill, &git_source).is_some()
                     }) {
@@ -4116,7 +4077,7 @@ mod tests {
             key: remote(url, None),
             result: Ok(revision.to_string()),
             unchanged: HashSet::new(),
-            unreachable: None,
+            comparison_error: None,
         })
     }
 
@@ -4281,7 +4242,7 @@ mod tests {
                 key: remote("https://example.test/a.git", None),
                 result: Err("could not read from remote".to_string()),
                 unchanged: HashSet::new(),
-                unreachable: None,
+                comparison_error: None,
             }),
         )
         .unwrap_err();
@@ -4295,22 +4256,21 @@ mod tests {
         );
     }
 
-    /// A head that resolved, followed by a subtree comparison that could not
-    /// reach the remote (#582).
-    fn prefetch_unreachable(url: &str, revision: &str, reason: &str) -> Option<PrefetchedRemote> {
+    /// A head that resolved, followed by a failed subtree comparison (#582).
+    fn prefetch_comparison_error(url: &str, revision: &str, reason: &str) -> Option<PrefetchedRemote> {
         Some(PrefetchedRemote {
-            unreachable: Some(reason.to_string()),
+            comparison_error: Some(reason.to_string()),
             ..prefetch(url, revision).unwrap()
         })
     }
 
     /// The repo moved, but whether a subpath skill's directory moved with it
-    /// was never established: the comparison could not reach the remote. That
+    /// was never established: the comparison failed. That
     /// is a failed check, like a head that could not be resolved — not an
     /// update, which the badge, the notification and auto-update would act on.
     /// The installed revision stays, so the next round compares again.
     #[test]
-    fn an_unreachable_subtree_comparison_records_a_failed_check() {
+    fn a_failed_subtree_comparison_records_a_failed_check() {
         let repo = test_repo();
         let url = "https://example.test/a.git";
         insert_monorepo_skill(&repo.store, "a", url, Some("skills/a"), "old-rev");
@@ -4320,7 +4280,7 @@ mod tests {
             &repo.store,
             "a",
             false,
-            prefetch_unreachable(url, "new-rev", reason),
+            prefetch_comparison_error(url, "new-rev", reason),
         )
         .unwrap_err();
 
@@ -4337,7 +4297,7 @@ mod tests {
     /// the moved head as its update, and a subpath skill already at the head
     /// is up to date, whatever became of the comparison.
     #[test]
-    fn an_unreachable_comparison_leaves_skills_it_does_not_answer_for() {
+    fn a_failed_comparison_leaves_skills_it_does_not_answer_for() {
         let repo = test_repo();
         let url = "https://example.test/a.git";
         insert_monorepo_skill(&repo.store, "root", url, None, "old-rev");
@@ -4347,29 +4307,13 @@ mod tests {
                 &repo.store,
                 id,
                 false,
-                prefetch_unreachable(url, "new-rev", "remote unreachable"),
+                prefetch_comparison_error(url, "new-rev", "remote unreachable"),
             )
             .unwrap()
         };
 
         assert_eq!(check("root").update_status, "update_available");
         assert_eq!(check("current").update_status, "up_to_date");
-    }
-
-    /// A failed comparison is a failed check only while the remote does not
-    /// resolve again. A remote that still resolves refused the request itself
-    /// — an installed revision it no longer has, a fetch it cannot serve — and
-    /// keeps reporting the update, as before (#582).
-    #[test]
-    fn a_failed_comparison_is_a_failed_check_only_while_the_remote_is_unreachable() {
-        let url = "https://example.test/a.git";
-        let error = "git exited with exit status: 128";
-
-        assert_eq!(
-            comparison_failure(url, error, || Err("could not resolve host".to_string())),
-            Some(error.to_string())
-        );
-        assert_eq!(comparison_failure(url, error, || Ok(())), None);
     }
 
     /// Callers hold the central-repo lock across this write, so a git skill with
@@ -4489,21 +4433,21 @@ mod tests {
         assert_eq!(b.source_revision.as_deref(), Some(head.as_str()));
     }
 
-    /// An installed revision the server no longer has (a force-push, say) cannot
-    /// be compared. The remote still resolves, so no retry would answer it, and
-    /// the check reports an update exactly as it always did (#582).
+    /// An installed revision the server no longer has cannot be compared.
+    /// A successful head lookup does not establish an update for that subtree.
     #[test]
-    fn an_unfetchable_installed_revision_still_reports_an_update() {
+    fn an_unfetchable_installed_revision_records_a_failed_check() {
         let repo = test_repo();
         let (dir, url, _) = monorepo(&repo);
         let gone = "0123456789abcdef0123456789abcdef01234567";
         insert_monorepo_skill(&repo.store, "b", &url, Some("skills/b"), gone);
         commit_file(&dir, "skills/a/SKILL.md", "---\nname: a\n---\nchanged\n");
 
-        let dto = check_skill_update_internal(&repo.store, "b", true, None).unwrap();
+        let err = check_skill_update_internal(&repo.store, "b", true, None).unwrap_err();
 
-        assert_eq!(dto.update_status, "update_available");
         let b = repo.store.get_skill_by_id("b").unwrap().unwrap();
+        assert_eq!(b.update_status, "error");
+        assert_eq!(b.last_check_error.as_deref(), Some(err.message.as_str()));
         assert_eq!(b.source_revision.as_deref(), Some(gone));
     }
 
